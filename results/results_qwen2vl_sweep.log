@@ -1,0 +1,76 @@
+extracting vlm__Qwen2-VL-2B-Instruct_448.npz over 1100 images...
+Loading base model Qwen/Qwen2-VL-2B-Instruct...
+VisualDecisionEngine initialized successfully.
+  0/1100  encode 617 ms  decide 96 ms
+  100/1100  encode 393 ms  decide 89 ms
+  200/1100  encode 403 ms  decide 91 ms
+  300/1100  encode 409 ms  decide 93 ms
+  400/1100  encode 410 ms  decide 94 ms
+  500/1100  encode 409 ms  decide 93 ms
+  600/1100  encode 404 ms  decide 92 ms
+  700/1100  encode 402 ms  decide 91 ms
+  800/1100  encode 402 ms  decide 91 ms
+  900/1100  encode 403 ms  decide 90 ms
+  1000/1100  encode 403 ms  decide 90 ms
+extracting vlm__Qwen2-VL-2B-Instruct_336.npz over 1100 images...
+Loading base model Qwen/Qwen2-VL-2B-Instruct...
+VisualDecisionEngine initialized successfully.
+  0/1100  encode 577 ms  decide 95 ms
+  100/1100  encode 227 ms  decide 83 ms
+  200/1100  encode 230 ms  decide 84 ms
+  300/1100  encode 230 ms  decide 84 ms
+  400/1100  encode 230 ms  decide 84 ms
+  500/1100  encode 230 ms  decide 84 ms
+  600/1100  encode 229 ms  decide 83 ms
+  700/1100  encode 228 ms  decide 83 ms
+  800/1100  encode 227 ms  decide 83 ms
+  900/1100  encode 226 ms  decide 83 ms
+  1000/1100  encode 225 ms  decide 82 ms
+extracting vlm__Qwen2-VL-2B-Instruct_224.npz over 1100 images...
+Loading base model Qwen/Qwen2-VL-2B-Instruct...
+VisualDecisionEngine initialized successfully.
+  0/1100  encode 398 ms  decide 78 ms
+  100/1100  encode 126 ms  decide 72 ms
+  200/1100  encode 128 ms  decide 73 ms
+  300/1100  encode 128 ms  decide 74 ms
+  400/1100  encode 128 ms  decide 74 ms
+  500/1100  encode 128 ms  decide 74 ms
+  600/1100  encode 128 ms  decide 74 ms
+  700/1100  encode 128 ms  decide 74 ms
+  800/1100  encode 128 ms  decide 74 ms
+  900/1100  encode 128 ms  decide 74 ms
+  1000/1100  encode 128 ms  decide 74 ms
+
+AUROC on test split (threshold-free; 0.5 = chance)
+config                                               human       vehicle        animal traffic_light    obstructed   lighting_ok    mean
+siglip:siglip-base-patch16-224/probe                 0.972         0.946         0.948         0.958         0.955         1.000   0.963
+vlm:Qwen2-VL-2B-Instruct_224/zeroshot                0.972         0.978         0.993         0.977         0.755         0.994   0.945
+vlm:Qwen2-VL-2B-Instruct_224/probe                   0.979         0.980         0.994         0.977         0.921         1.000   0.975
+vlm:Qwen2-VL-2B-Instruct_336/zeroshot                0.980         0.994         0.994         0.978         0.758         0.999   0.951
+vlm:Qwen2-VL-2B-Instruct_336/probe                   0.985         0.993         0.991         0.976         0.930         1.000   0.979
+vlm:Qwen2-VL-2B-Instruct_448/zeroshot                0.992         0.993         0.997         0.986         0.746         0.999   0.952
+vlm:Qwen2-VL-2B-Instruct_448/probe                   0.990         0.993         0.998         0.987         0.875         1.000   0.974
+
+Small-object AUROC (positives with max object area < 1% of frame vs. all negatives)
+siglip:siglip-base-patch16-224/probe          human=0.937 (n=34)  vehicle=0.925 (n=31)  animal=0.811 (n=10)  traffic_light=0.946 (n=51)
+vlm:Qwen2-VL-2B-Instruct_224/zeroshot         human=0.909 (n=34)  vehicle=0.949 (n=31)  animal=0.980 (n=10)  traffic_light=0.973 (n=51)
+vlm:Qwen2-VL-2B-Instruct_224/probe            human=0.936 (n=34)  vehicle=0.965 (n=31)  animal=0.983 (n=10)  traffic_light=0.971 (n=51)
+vlm:Qwen2-VL-2B-Instruct_336/zeroshot         human=0.918 (n=34)  vehicle=0.983 (n=31)  animal=0.981 (n=10)  traffic_light=0.974 (n=51)
+vlm:Qwen2-VL-2B-Instruct_336/probe            human=0.951 (n=34)  vehicle=0.981 (n=31)  animal=0.964 (n=10)  traffic_light=0.971 (n=51)
+vlm:Qwen2-VL-2B-Instruct_448/zeroshot         human=0.964 (n=34)  vehicle=0.983 (n=31)  animal=0.997 (n=10)  traffic_light=0.981 (n=51)
+vlm:Qwen2-VL-2B-Instruct_448/probe            human=0.962 (n=34)  vehicle=0.983 (n=31)  animal=0.998 (n=10)  traffic_light=0.983 (n=51)
+
+Operating point @0.5: balanced accuracy / false-negative rate / calibration error (ECE)
+siglip:siglip-base-patch16-224/probe          human 0.92/0.08/0.03  vehicle 0.86/0.24/0.06  animal 0.92/0.17/0.03  traffic_ 0.86/0.24/0.07  obstruct 0.88/0.11/0.05  lighting 0.99/0.00/0.03
+vlm:Qwen2-VL-2B-Instruct_224/zeroshot         human 0.93/0.10/0.03  vehicle 0.81/0.38/0.14  animal 0.94/0.06/0.07  traffic_ 0.83/0.34/0.04  obstruct 0.63/0.68/0.24  lighting 0.80/0.00/0.23
+vlm:Qwen2-VL-2B-Instruct_224/probe            human 0.94/0.07/0.05  vehicle 0.91/0.15/0.04  animal 0.96/0.08/0.02  traffic_ 0.89/0.18/0.04  obstruct 0.85/0.14/0.09  lighting 0.99/0.00/0.02
+vlm:Qwen2-VL-2B-Instruct_336/zeroshot         human 0.94/0.08/0.03  vehicle 0.80/0.40/0.13  animal 0.96/0.02/0.07  traffic_ 0.87/0.24/0.03  obstruct 0.64/0.70/0.25  lighting 0.91/0.00/0.22
+vlm:Qwen2-VL-2B-Instruct_336/probe            human 0.93/0.07/0.04  vehicle 0.96/0.06/0.02  animal 0.96/0.08/0.01  traffic_ 0.90/0.15/0.06  obstruct 0.85/0.19/0.05  lighting 0.99/0.00/0.02
+vlm:Qwen2-VL-2B-Instruct_448/zeroshot         human 0.95/0.05/0.04  vehicle 0.79/0.42/0.13  animal 0.96/0.02/0.07  traffic_ 0.88/0.21/0.04  obstruct 0.59/0.75/0.27  lighting 0.92/0.00/0.20
+vlm:Qwen2-VL-2B-Instruct_448/probe            human 0.94/0.06/0.04  vehicle 0.95/0.06/0.04  animal 0.96/0.08/0.01  traffic_ 0.92/0.10/0.05  obstruct 0.77/0.25/0.14  lighting 0.99/0.00/0.01
+
+Latency per frame (p50 / p95 ms; VLM decide = all 6 queries in one batch)
+siglip:siglip-base-patch16-224                encode 8/10
+vlm:Qwen2-VL-2B-Instruct_224                  encode 128/150  decide 74/75  visual_tokens≈66
+vlm:Qwen2-VL-2B-Instruct_336                  encode 224/244  decide 81/87  visual_tokens≈144
+vlm:Qwen2-VL-2B-Instruct_448                  encode 404/443  decide 91/98  visual_tokens≈256

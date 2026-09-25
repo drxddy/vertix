@@ -1,0 +1,9 @@
+# venv-mlx/bin/python mlx_bench.py --image image.png --budgets 448,224  (M5, 16 GB; p50/p95 ms)
+mlx-community/Qwen2-VL-2B-Instruct-bf16      392x504 tokens= 252  vision  203.8/ 204.9 ms  prefill+query  298.0/ 299.1 ms  P(Yes|human)=0.999
+mlx-community/Qwen2-VL-2B-Instruct-bf16      196x252 tokens=  63  vision   47.0/  47.3 ms  prefill+query   91.0/  91.4 ms  P(Yes|human)=0.999
+mlx-community/Qwen2-VL-2B-Instruct-4bit      392x504 tokens= 252  vision  211.1/ 212.5 ms  prefill+query  310.7/ 311.6 ms  P(Yes|human)=0.998
+mlx-community/Qwen2-VL-2B-Instruct-4bit      196x252 tokens=  63  vision   47.3/  47.7 ms  prefill+query  121.4/ 121.7 ms  P(Yes|human)=0.998
+mlx-community/Qwen3-VL-2B-Instruct-bf16      384x512 tokens= 192  vision   71.4/  72.0 ms  prefill+query  147.6/ 148.3 ms  P(Yes|human)=1.000
+mlx-community/Qwen3-VL-2B-Instruct-bf16      192x256 tokens=  70  vision   32.1/  32.3 ms  prefill+query   81.1/  81.6 ms  P(Yes|human)=1.000
+mlx-community/Qwen3-VL-2B-Instruct-4bit      384x512 tokens= 192  vision   71.3/  71.8 ms  prefill+query  170.1/ 170.4 ms  P(Yes|human)=1.000
+mlx-community/Qwen3-VL-2B-Instruct-4bit      192x256 tokens=  70  vision   32.2/  32.6 ms  prefill+query  119.9/ 120.0 ms  P(Yes|human)=1.000

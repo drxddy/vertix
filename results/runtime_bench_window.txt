@@ -1,0 +1,28 @@
+mode window  source data/video_eval/replay.mp4  fps 8.0  window 2.0 s (8 groups)  realtime True
+
+509 ticks over 127.9 s  |  dropped groups 0  |  GPU busy ≈ 90%
+Tier 2 ran on 507/509 ticks  (3.97 Hz)
+stage          p50 ms   p95 ms
+vision_ms        26.0     33.9
+append_ms         0.0      0.0
+prefill_ms      149.2    159.9
+decide_ms        52.3     57.7
+tick_ms         228.4    247.0
+
+Decision age (t_decided - newest frame used), ms
+  tier 0: p50      0  p95      1  (n=5120)
+  tier 1: p50     27  p95    100  (n=2517)
+  tier 2: p50    229  p95    322  (n=3042)
+
+End-to-end accuracy of Tier 1/2 answers vs the segment being shown when the answer was produced (first 2.0 s of each segment excluded while the window fills with it)
+question               n  pos  bal.acc  raw@0.5  uncertain  flips/min static
+cam_forward          111   16     0.61     0.61       0.00               0.0
+cam_forward_head     111   16     0.49     0.64       0.00               7.5
+cam_moving           111   63     0.50     0.50       0.00               0.0
+cam_moving_head      111   63     0.71     0.69       0.00               1.9
+cam_pan_right        111   16     0.50     0.59       0.00               0.0
+obj_approach         143   16     0.47     0.88       0.00               0.0
+obj_approach_head    143   16     0.86     0.86       0.00               7.5
+obj_moving           143   63     0.66     0.70       0.00               5.6
+obj_right            143   15     0.50     0.73       0.00               1.9
+obj_right_head       143   15     0.53     0.62       0.00               5.6

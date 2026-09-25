@@ -1,0 +1,14 @@
+# Python environments
+venv/
+venv-mlx/
+__pycache__/
+.pytest_cache/
+
+# Datasets, downloaded videos and feature caches (rebuilt by the scripts in data/ and video_eval/)
+data/*
+!data/*.py
+
+# Large runtime logs (reports in results/ are kept)
+results/*.jsonl
+
+.DS_Store

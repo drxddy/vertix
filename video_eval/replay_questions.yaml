@@ -1,0 +1,34 @@
+# Questions for the synthetic replay benchmark: same ids and wording as the synthetic motion set, so
+# runtime answers can be scored against each segment's labels. Tier 1 heads are kept to exercise the
+# full pipeline under load.
+questions:
+  - id: cam_forward
+    text: Is the camera moving forward, getting closer to the scene?
+  - id: cam_moving
+    text: Is the camera moving?
+  - id: cam_pan_right
+    text: Is the camera panning to the right?
+  - id: obj_approach
+    text: Is the person moving toward the camera?
+  - id: obj_right
+    text: Is the person moving to the right?
+  - id: obj_moving
+    text: Is the person moving?
+  - id: human_present
+    tier: 1
+    head: heads/human.npz
+    enter: 0.4
+    exit: 0.2
+  # Motion heads with the same ids as the zero-shot questions above, suffixed _head, for comparison
+  - id: obj_approach_head
+    tier: 1
+    head: heads/motion_obj_approach.npz
+  - id: obj_right_head
+    tier: 1
+    head: heads/motion_obj_right.npz
+  - id: cam_forward_head
+    tier: 1
+    head: heads/motion_cam_forward.npz
+  - id: cam_moving_head
+    tier: 1
+    head: heads/motion_cam_moving.npz

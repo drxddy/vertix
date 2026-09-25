@@ -1,0 +1,75 @@
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+Traceback (most recent call last):
+  File "/Users/dhikshithreddy/Developer/vertix/ladder.py", line 240, in <module>
+    main()
+  File "/Users/dhikshithreddy/Developer/vertix/ladder.py", line 234, in main
+    extract_siglip(args.model)
+  File "/Users/dhikshithreddy/Developer/vertix/ladder.py", line 98, in extract_siglip
+    processor = AutoProcessor.from_pretrained(model_id)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dhikshithreddy/Developer/vertix/venv/lib/python3.11/site-packages/transformers/models/auto/processing_auto.py", line 330, in from_pretrained
+    return processor_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dhikshithreddy/Developer/vertix/venv/lib/python3.11/site-packages/transformers/processing_utils.py", line 1736, in from_pretrained
+    args = cls._get_arguments_from_pretrained(pretrained_model_name_or_path, processor_dict, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dhikshithreddy/Developer/vertix/venv/lib/python3.11/site-packages/transformers/processing_utils.py", line 1861, in _get_arguments_from_pretrained
+    tokenizer = cls._load_tokenizer_from_pretrained(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dhikshithreddy/Developer/vertix/venv/lib/python3.11/site-packages/transformers/processing_utils.py", line 1797, in _load_tokenizer_from_pretrained
+    tokenizer = auto_processor_class.from_pretrained(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dhikshithreddy/Developer/vertix/venv/lib/python3.11/site-packages/transformers/models/auto/tokenization_auto.py", line 942, in from_pretrained
+    return tokenizer_class.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dhikshithreddy/Developer/vertix/venv/lib/python3.11/site-packages/transformers/tokenization_utils_base.py", line 1736, in from_pretrained
+    return cls._from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dhikshithreddy/Developer/vertix/venv/lib/python3.11/site-packages/transformers/tokenization_utils_base.py", line 1932, in _from_pretrained
+    tokenizer = cls(*init_inputs, **init_kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dhikshithreddy/Developer/vertix/venv/lib/python3.11/site-packages/transformers/models/siglip/tokenization_siglip.py", line 100, in __init__
+    requires_backends(self, "protobuf")
+  File "/Users/dhikshithreddy/Developer/vertix/venv/lib/python3.11/site-packages/transformers/utils/import_utils.py", line 2374, in requires_backends
+    raise ImportError("".join(failed))
+ImportError: 
+SiglipTokenizer requires the protobuf library but it was not found in your environment. Check out the instructions on the
+installation page of its repo: https://github.com/protocolbuffers/protobuf/tree/master/python#installation and follow the ones
+that match your environment. Please note that you may need to restart your runtime after installation.
+
+siglip exit 
+Loading base model Qwen/Qwen3-VL-2B-Instruct...
+VisualDecisionEngine initialized successfully.
+  frame 0/3371  encode 385 ms
+  frame 250/3371  encode 130 ms
+  frame 500/3371  encode 132 ms
+  frame 750/3371  encode 133 ms
+  frame 1000/3371  encode 134 ms
+  frame 1250/3371  encode 135 ms
+  frame 1500/3371  encode 135 ms
+  frame 1750/3371  encode 135 ms
+  frame 2000/3371  encode 136 ms
+  frame 2250/3371  encode 136 ms
+  frame 2500/3371  encode 136 ms
+  frame 2750/3371  encode 136 ms
+  frame 3000/3371  encode 137 ms
+  frame 3250/3371  encode 137 ms
+vlm224 exit 
+Loading base model Qwen/Qwen3-VL-2B-Instruct...
+VisualDecisionEngine initialized successfully.
+  frame 0/3371  encode 470 ms
+  frame 250/3371  encode 202 ms
+  frame 500/3371  encode 208 ms
+  frame 750/3371  encode 212 ms
+  frame 1000/3371  encode 212 ms
+  frame 1250/3371  encode 211 ms
+  frame 1500/3371  encode 210 ms
+  frame 1750/3371  encode 209 ms
+  frame 2000/3371  encode 209 ms
+  frame 2250/3371  encode 209 ms
+  frame 2500/3371  encode 208 ms
+  frame 2750/3371  encode 206 ms
+  frame 3000/3371  encode 205 ms
+  frame 3250/3371  encode 204 ms
+vlm448 exit 

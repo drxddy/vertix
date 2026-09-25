@@ -1,0 +1,32 @@
+  frame 0/3371  encode 346 ms
+  frame 250/3371  encode 75 ms
+  frame 500/3371  encode 76 ms
+  frame 750/3371  encode 76 ms
+  frame 1000/3371  encode 77 ms
+  frame 1250/3371  encode 77 ms
+  frame 1500/3371  encode 77 ms
+  frame 1750/3371  encode 77 ms
+  frame 2000/3371  encode 78 ms
+  frame 2250/3371  encode 78 ms
+  frame 2500/3371  encode 78 ms
+  frame 2750/3371  encode 78 ms
+  frame 3000/3371  encode 78 ms
+  frame 3250/3371  encode 79 ms
+wrote /Users/dhikshithreddy/Developer/vertix/data/cache/ladder_vlm__Qwen3.5-2B-bf16_224.npz
+budget 224 exit 
+  frame 0/3371  encode 353 ms
+  frame 250/3371  encode 173 ms
+  frame 500/3371  encode 161 ms
+  frame 750/3371  encode 154 ms
+  frame 1000/3371  encode 152 ms
+  frame 1250/3371  encode 150 ms
+  frame 1500/3371  encode 148 ms
+  frame 1750/3371  encode 147 ms
+  frame 2000/3371  encode 146 ms
+  frame 2250/3371  encode 146 ms
+  frame 2500/3371  encode 146 ms
+  frame 2750/3371  encode 146 ms
+  frame 3000/3371  encode 145 ms
+  frame 3250/3371  encode 146 ms
+wrote /Users/dhikshithreddy/Developer/vertix/data/cache/ladder_vlm__Qwen3.5-2B-bf16_448.npz
+budget 448 exit 

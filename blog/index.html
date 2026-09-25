@@ -1,0 +1,720 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vertix Decision Engine</title>
+<meta name="description" content="A technical write-up of building a shared-prefix VLM decision engine for live video on Apple Silicon.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap">
+<link rel="stylesheet" href="style.css">
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "neutral" });
+</script>
+</head>
+<body>
+<nav class="sitenav" aria-label="Site">
+  <a class="brand" href="./">vertix</a>
+  <a href="./" aria-current="page">Article</a>
+  <a href="https://github.com/drxddy/vertix">GitHub</a>
+</nav>
+<header class="masthead">
+  <p class="eyebrow">Engineering notes · vertix</p>
+  <h1>Decisions, not tokens: a shared-prefix VLM engine for live video</h1>
+  <p class="dek">I turned a generative vision-language model into a low-latency decision engine, made each piece of it provably exact, measured where it actually earns its cost, built a real-time runtime that answers batched questions about the last few seconds of video at 4 Hz on a laptop, and then learned what a real webcam could still break.</p>
+  <p class="byline">September 2026</p>
+</header>
+
+<div class="page">
+  <aside class="toc" aria-label="Contents">
+    <nav>
+      <h2>Contents</h2>
+      <ol>
+        <li><a href="#premise">The premise and its corrections</a></li>
+        <li><a href="#exact">Making the shared prefix exact</a></li>
+        <li><a href="#baseline">An honest baseline</a></li>
+        <li><a href="#ladder">The decision ladder</a></li>
+        <li><a href="#hybrid">Qwen3.5 on MLX: forking a hybrid model</a></li>
+        <li><a href="#video">From frames to video</a></li>
+        <li><a href="#time">Does the model use time?</a></li>
+        <li><a href="#motion">Motion lives in the features</a></li>
+        <li><a href="#runtime">The runtime</a></li>
+        <li><a href="#stream">Streaming prefill</a></li>
+        <li><a href="#field">Field test: a real webcam</a></li>
+        <li><a href="#lessons">What I learned</a></li>
+        <li><a href="#repro">Reproducing it</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <article>
+    <div class="stats" role="list">
+      <div class="stat" role="listitem"><span class="v">3.96 Hz</span><span class="l">VLM reasoning rate over a 2–4 s video window, 6 questions per tick, no dropped frames</span></div>
+      <div class="stat" role="listitem"><span class="v">0.0</span><span class="l">max difference between forked batch decisions and the model's native single-pass path (fp32)</span></div>
+      <div class="stat" role="listitem"><span class="v">0.86 vs 0.54</span><span class="l">spatial-question AUROC: VLM vs a SigLIP image + text fusion classifier</span></div>
+      <div class="stat" role="listitem"><span class="v">0.945</span><span class="l">"is the person approaching?" AUROC from a linear head on vision features; zero-shot was 0.545</span></div>
+    </div>
+
+    <!-- ============================================================ 1 -->
+    <section id="premise">
+      <h2><span class="num">01</span>The premise and its corrections</h2>
+      <p>Most VLM demos ask a model to describe an image. Robots and monitoring systems don't need descriptions. They need answers to specific questions, many at once, over and over:</p>
+      <blockquote><p>Is a person present? Is the person holding a pen? Is the door behind them open? Is anyone on their phone?</p></blockquote>
+      <p>Asking a VLM each of those as a separate prompt means re-encoding the image and decoding text every time. This project builds the opposite: encode the frame once, fork every question off that shared state in a single batch, and read a probability instead of generating tokens.</p>
+<pre><code>frame ──► vision encoder ──► LM prefill ──► prefix state
+                                              ├─► "Is a person present?"          → P(Yes)
+                                              ├─► "Is the person holding a pen?"  → P(Yes)
+                                              └─► … N questions, one batched forward</code></pre>
+      <p>The starting point was an architecture blueprint for an "edge-optimized visual decision engine". Its argument: a VLM that answers structured questions about a camera frame should never decode text. Instead:</p>
+      <ol>
+        <li><strong>Causal prefix.</strong> Run the vision encoder and the language model over the image once, and keep the resulting KV cache as the frame's state.</li>
+        <li><strong>Tree attention.</strong> Pack many questions (<code>&lt;q&gt; Is a human present? &lt;opt&gt; Yes &lt;/opt&gt; …&lt;decide&gt;</code>) behind that prefix, with a block-diagonal mask so each branch sees the image and itself, never another branch.</li>
+        <li><strong>Pointer head.</strong> Read the hidden state at each <code>&lt;decide&gt;</code> token and compare it against the option tokens to get a probability distribution in one forward pass.</li>
+      </ol>
+      <p>A review of the blueprint corrected several claims before I wrote code. Visual KV reuse is intra-frame, not temporal: a new frame needs a new vision pass and a new prefill. Radix-style prefix caching deduplicates identical tokens, not similar-looking frames. Option-token hidden states are not class prototypes, so a pointer head needs training. And 30 Hz is not implied by any of this for a 2B-parameter model at useful resolution.</p>
+      <p>So the project became a sequence of questions, each answered with a measurement:</p>
+      <ul>
+        <li>Can the shared prefix be made exactly equal to running each question alone?</li>
+        <li>On what kind of decision does a VLM beat a cheap image classifier?</li>
+        <li>How deep into the model does each kind of decision become readable?</li>
+        <li>Does the model use time when given video, and can the whole thing run live?</li>
+      </ul>
+    </section>
+
+    <!-- ============================================================ 2 -->
+    <section id="exact">
+      <h2><span class="num">02</span>Making the shared prefix exact</h2>
+      <p>The first implementation (PyTorch, Qwen2-VL-2B on MPS) looked plausible on reading. It had four bugs stacked on top of each other, and a fallback that would have hidden them.</p>
+
+      <h3>Bug 1: M-RoPE positions are not token indices</h3>
+      <p>Qwen2-VL uses multimodal rotary embeddings: image tokens get 3D (temporal, height, width) positions that span far fewer indices than there are tokens. A prefix of <strong>282 tokens</strong> (256 of them visual) ends at text position <strong>41</strong>, so the first query token belongs at position 42, not 282. The suffix pass passed no <code>position_ids</code>, so transformers 5.17's <code>compute_3d_position_ids</code> built positions from a 2D mask covering prefix + suffix, for an input that was suffix-only. The result could not line up with the suffix tokens, and it also leaned on <code>rope_deltas</code> state left behind by earlier calls.</p>
+
+      <h3>Bug 2: failures were caught</h3>
+      <p>A <code>try/except</code> around the suffix pass fell back to the naive path, which repeats the image once per question. Any failure in the shared path would have been timed as the baseline and reported as the "optimized" number. I removed the fallback: a failure should raise.</p>
+
+      <h3>Bug 3: a trailing space changed the tokens</h3>
+      <p>The prefix ended in <code>"…based on the image: "</code>. Tokenized as one string, <code>": Is a human…"</code> merges the space into <code>" Is"</code>. Tokenized as prefix and suffix separately, it does not. Different token ids meant the shared path could never match a full-sequence run (cosine 0.997, max diff up to 5.5). Ending the prefix with <code>"\n"</code> fixes it, because the Qwen pre-tokenizer always splits newlines into their own token:</p>
+<pre><code>'image: '  + 'Is a human present?'  -> ids equal to full string? <span class="k">False</span>
+'image:\n' + 'Is a human present?'  -> ids equal to full string? <span class="k">True</span></code></pre>
+
+      <h3>Bug 4: the cache API moved</h3>
+      <p>transformers 5.x stores <code>DynamicCache</code> as <code>layers[i].keys / .values</code>. The old code looked for <code>key_cache</code>, silently took a legacy tuple branch, and never exercised the intended path.</p>
+
+      <h3>The fixed design</h3>
+      <p>I did not build a literal packed sequence with a tree mask. Each question is a row in a batch of N, all reading one copy of the prefix KV cache. Attention never crosses batch rows, so branch isolation is exactly the block-diagonal property, with no mask to materialize:</p>
+<pre><code><span class="c"># engine.py (torch), core of decision_hidden()</span>
+text_pos     = torch.arange(prefix.next_pos, prefix.next_pos + S)      <span class="c"># starts at 42, not 282</span>
+position_ids = text_pos.view(1, 1, -1).expand(3, N, -1)                <span class="c"># text: t = h = w</span>
+attention    = torch.cat([ones(N, prefix_len), suffix.attention_mask], dim=1)  <span class="c"># right padding</span>
+out = model.model(input_ids=suffix.input_ids, attention_mask=attention,
+                  position_ids=position_ids,
+                  past_key_values=expanded_cache(prefix, N))           <span class="c"># fresh cache object per call</span>
+decision = out.last_hidden_state[rows, suffix.attention_mask.sum(1) - 1]   <span class="c"># last real token</span></code></pre>
+      <p>Explicit positions bypass <code>compute_3d_position_ids</code>, so nothing depends on the model's cached <code>rope_deltas</code> state. A new cache object per call means the shared prefix is never mutated.</p>
+
+      <h3>Proving it, with a control that must fail</h3>
+      <p><code>check_equivalence.py</code> compares each question's decision hidden state from the batched path against one ordinary full-sequence forward. An equivalence test that always passes proves nothing, so the script has a <code>--wrong-pos</code> mode that deliberately uses <code>prefix_len</code> as the start position.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Check</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td>CPU, fp32, 4 queries of different lengths</td><td>max |diff| 0.8–1.2 × 10<sup>-4</sup>, cosine 1.000000</td></tr>
+          <tr><td>MPS, bf16</td><td>identical outputs</td></tr>
+          <tr><td>Prefix cache after answering</td><td>unchanged, so one frame can serve many batches</td></tr>
+          <tr><td>Control: positions start at <code>prefix_len</code></td><td><span class="neg">fails</span>, cosine 0.89–0.97</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>What sharing buys</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Queries</th><th class="n">Shared prefix</th><th class="n">Naive, batched</th><th class="n">Naive, sequential</th><th class="n">Speedup</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td class="n">375 ms</td><td class="n">336 ms</td><td class="n">337 ms</td><td class="n"><span class="neg">0.9×</span></td></tr>
+          <tr><td>8</td><td class="n">408 ms</td><td class="n">2,330 ms</td><td class="n">2,693 ms</td><td class="n">6.6×</td></tr>
+          <tr><td>32</td><td class="n">512 ms</td><td class="n">11,616 ms</td><td class="n">12,254 ms</td><td class="n">23.9×</td></tr>
+        </tbody>
+      </table></div>
+      <p class="caption">Qwen2-VL-2B, MPS, bf16, 448² budget (256 visual tokens), p50 of 20 runs after 3 warmups, with <code>torch.mps.synchronize()</code> around every measurement.</p>
+      <p>The frame encode is 329 ms of each total. Sharing makes additional questions almost free, but it does nothing for that fixed cost, and with a single question the extra pass costs 40 ms. The shared prefix also is not "stored once" in memory yet: <code>DynamicLayer.update</code> concatenates, so expanding the cache to N rows materializes N copies of the prefix KV. The compute is shared, the bandwidth is not. The hybrid model in section 5 removes most of that cost.</p>
+    </section>
+
+    <!-- ============================================================ 3 -->
+    <section id="baseline">
+      <h2><span class="num">03</span>An honest baseline</h2>
+      <p>A decision engine is only useful if it beats cheaper models on the decisions you care about, so I built an evaluation set before optimizing anything.</p>
+      <div class="two-col">
+        <div class="kv">
+          <h4>Labels from COCO val2017</h4>
+          <ul>
+            <li>human, land vehicle, animal, traffic light</li>
+            <li>traffic lights enriched: 160 of COCO val's 191 images with one</li>
+            <li>per-object area fraction kept, so small objects can be scored separately</li>
+          </ul>
+        </div>
+        <div class="kv">
+          <h4>Synthetic camera faults</h4>
+          <ul>
+            <li>lens obstruction: a translucent, shaded, blurred blob entering from an edge (25–55% of frame)</li>
+            <li>low light: exposure × 0.1–0.3, gamma, sensor noise</li>
+            <li>1,100 images total, split 400 / 300 by source image</li>
+          </ul>
+        </div>
+      </div>
+      <p>The first corruption draft was too easy: a flat, opaque blob covering 60–70% of the frame, and near-black low-light images. Any model would have scored near 1.0, and the test would have measured nothing. I made both harder before running any model.</p>
+      <p>The comparison is a linear probe (logistic regression) on frozen features for every model, plus the VLM's zero-shot P(Yes). The VLM's feature is the decision token's hidden state; SigLIP's is its image embedding.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Readout</th><th class="n">Mean AUROC</th><th class="n">Small traffic lights</th><th class="n">Obstructed</th><th class="n">Encode + 6 questions</th></tr></thead>
+        <tbody>
+          <tr><td>SigLIP-base-224, probe</td><td class="n">0.963</td><td class="n">0.946</td><td class="n">0.955</td><td class="n">8 ms</td></tr>
+          <tr><td>SigLIP-so400m-384, probe</td><td class="n">0.975</td><td class="n">0.934</td><td class="n"><strong>0.994</strong></td><td class="n">90 ms</td></tr>
+          <tr><td>Qwen2-VL-2B @224, probe</td><td class="n">0.975</td><td class="n">0.971</td><td class="n">0.921</td><td class="n">128 + 74 ms</td></tr>
+          <tr><td>Qwen2-VL-2B @448, probe</td><td class="n">0.974</td><td class="n">0.983</td><td class="n">0.875</td><td class="n">404 + 91 ms</td></tr>
+          <tr><td>Qwen2.5-VL-3B @336, probe</td><td class="n">0.973</td><td class="n">0.988</td><td class="n">0.889</td><td class="n">294 + 151 ms</td></tr>
+          <tr><td>Qwen3-VL-2B @224, probe</td><td class="n">0.982</td><td class="n">0.981</td><td class="n">0.941</td><td class="n">130 + 93 ms</td></tr>
+          <tr class="hl"><td>Qwen3-VL-2B @448, probe</td><td class="n"><strong>0.985</strong></td><td class="n"><strong>0.996</strong></td><td class="n">0.928</td><td class="n">183 + 102 ms</td></tr>
+          <tr><td>Qwen3-VL-2B @448, zero-shot</td><td class="n">0.949</td><td class="n">0.996</td><td class="n">0.720</td><td class="n">same</td></tr>
+        </tbody>
+      </table></div>
+      <p class="caption">Test split AUROC over six tasks. "Small" means the largest instance covers under 1% of the frame. PyTorch MPS, bf16.</p>
+      <ul>
+        <li><strong>Resolution matters little here.</strong> Qwen3-VL at 224 is within 0.003 of 448, at 70% of the encode time.</li>
+        <li><strong>Zero-shot probabilities rank well but are not calibrated.</strong> At a 0.5 cutoff, Qwen2-VL @448 missed 42% of vehicles and 75% of obstructions. A probe on the same forward pass cut vehicle misses to 6% and calibration error from 0.13 to 0.04.</li>
+        <li><strong>On MLX, 4-bit weights were slower than bf16</strong> (Qwen3-VL-2B: 120 vs 81 ms at 224, 170 vs 148 ms at 448). Prefill over hundreds of tokens is compute-bound, so dequantization is pure overhead. This contradicts the blueprint's bandwidth argument for quantizing.</li>
+      </ul>
+      <div class="finding"><span class="tag">Finding</span><p>On "is there an X" questions, a 2B VLM buys about 0.01–0.02 AUROC over an 8 ms image classifier, at 25× the cost. Its advantage is concentrated in small objects. That is not a strong enough reason to put a VLM in the loop.</p></div>
+    </section>
+
+    <!-- ============================================================ 4 -->
+    <section id="ladder">
+      <h2><span class="num">04</span>The decision ladder</h2>
+      <p>The COCO tasks test what classifiers already do well. To test what a VLM should be good at, I built a graded set of 10,304 yes/no questions over 3,371 images. Splits are by image, so a probe never sees a test image.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Family</th><th>Source</th><th class="n">Questions</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td>Presence</td><td>COCO tasks above</td><td class="n">3,584</td><td>Is there an animal in the image?</td></tr>
+          <tr><td>Spatial</td><td>VSR test set, statements rewritten as questions</td><td class="n">2,195</td><td>Is it true that the cat is on the laptop?</td></tr>
+          <tr><td>Compositional</td><td>GQA testdev-balanced, yes/no answers only</td><td class="n">4,525</td><td>Is the cup to the left of the plate?</td></tr>
+        </tbody>
+      </table></div>
+      <p>The baseline changes too. On question-specific tasks an image-only classifier cannot see the question, so the fast competitor becomes SigLIP-so400m image and text embeddings combined as <code>[i, t, i ⊙ t]</code> into a logistic probe. A text-only probe measures how much the answer can be guessed from the wording alone.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Readout</th><th class="n">Spatial AUROC</th><th class="n">GQA AUROC</th><th class="n">Spatial acc.</th><th class="n">GQA acc.</th></tr></thead>
+        <tbody>
+          <tr><td>SigLIP text only</td><td class="n">0.451</td><td class="n">0.568</td><td class="n">46.6%</td><td class="n">54.6%</td></tr>
+          <tr><td>SigLIP image + text fusion</td><td class="n">0.542</td><td class="n">0.582</td><td class="n">53.5%</td><td class="n">56.3%</td></tr>
+          <tr><td>Qwen3-VL-2B @448, best layer probe</td><td class="n">0.850</td><td class="n">0.857</td><td class="n">77.4%</td><td class="n">77.2%</td></tr>
+          <tr class="hl"><td>Qwen3.5-2B @448, best layer probe</td><td class="n">0.864</td><td class="n">0.850</td><td class="n">79.5%</td><td class="n">75.8%</td></tr>
+          <tr><td>Qwen3.5-2B @448, zero-shot</td><td class="n"><strong>0.872</strong></td><td class="n">0.840</td><td class="n">78.3%</td><td class="n">76.3%</td></tr>
+        </tbody>
+      </table></div>
+      <div class="finding"><span class="tag">Finding</span><p>On relational questions the dual encoder scores at chance and the VLM reaches 0.85–0.87 AUROC. This is where the architecture earns its cost. Zero-shot is as good as a trained head here, so new questions in plain English work without training.</p></div>
+
+      <h3>How deep does each decision need to go?</h3>
+      <p>Because the forked batch returns hidden states at every layer, I fitted a probe per layer. The chart puts both models on relative depth, so their 28 and 24 layers line up.</p>
+
+      <figure>
+        <div class="chart-card">
+          <div class="chart-head">
+            <span class="t">Probe AUROC by relative depth, 448 budget</span>
+            <div class="legend" aria-hidden="true">
+              <span><i class="s1"></i>Qwen3.5-2B (24 layers)</span>
+              <span><i class="s2"></i>Qwen3-VL-2B (28 layers)</span>
+            </div>
+          </div>
+          <div class="panels" id="depth-chart"></div>
+          <details class="tableview">
+            <summary>Show the data as a table</summary>
+            <div class="table-wrap" id="depth-table"></div>
+          </details>
+        </div>
+        <figcaption>Test AUROC of a logistic probe on the decision-token hidden state after each layer (every other layer). Hover a panel to read exact values. Presence tasks sit at 0.95–0.99 from layer 4 onward and are omitted.</figcaption>
+      </figure>
+
+      <ul>
+        <li><strong>Reasoning appears abruptly, then plateaus.</strong> Qwen3-VL is near chance until layer 12 and jumps between layers 14 and 16 (spatial 0.66 → 0.82). Qwen3.5 reaches its plateau earlier, by layer 14 of 24 (58% of depth). Stopping there keeps essentially all the accuracy.</li>
+        <li><strong>Presence does not need the language model at all.</strong> The mean of the visual tokens straight out of the vision encoder (layer 0, before any language-model layer) scores 0.97–0.98, against 0.99 for the best full-depth readout.</li>
+      </ul>
+      <p>The architecture this suggests has tiers: camera health on SigLIP, presence on pooled vision features, and the language model only for relational and open-ended questions, stopped early when a trained head allows it.</p>
+    </section>
+
+    <!-- ============================================================ 5 -->
+    <section id="hybrid">
+      <h2><span class="num">05</span>Qwen3.5 on MLX: forking a hybrid model</h2>
+      <p>Qwen3.5-2B (February 2026) has the same vision grid as Qwen3-VL but a hybrid language model. That changes what "the prefix state" is:</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Layer type</th><th class="n">Count</th><th>State after the prefix</th><th>Shape per layer</th></tr></thead>
+        <tbody>
+          <tr><td>Gated DeltaNet (linear attention)</td><td class="n">18</td><td>conv window + recurrent state, fixed size regardless of prefix length</td><td><code>(1, 3, 6144)</code> + <code>(1, 16, 128, 128)</code> fp32, ≈1 MB</td></tr>
+          <tr><td>Full attention, 2 KV heads</td><td class="n">6</td><td>KV cache, grows with the prefix</td><td><code>(1, 2, T, 256)</code></td></tr>
+        </tbody>
+      </table></div>
+      <p>Forking N question branches from this state can be free. The question is whether the suffix pass ever writes into shared memory. Reading mlx-vlm's cache code settled it: <code>ArraysCache.update_window</code> and the gated-delta kernel <em>replace</em> the conv and recurrent states, and <code>KVCache</code> reallocates when tokens are appended. So a fork can be a set of broadcast views:</p>
+<pre><code><span class="c"># mlx_engine.py</span>
+<span class="k">def</span> _fork(cache, n, n_layers):
+    forked = []
+    <span class="k">for</span> c <span class="k">in</span> cache[:n_layers]:
+        <span class="k">if</span> isinstance(c, KVCache):                         <span class="c"># 6 full-attention layers</span>
+            keys, values = c.state
+            f = KVCache()
+            f.keys   = mx.broadcast_to(keys,   (n,) + keys.shape[1:])
+            f.values = mx.broadcast_to(values, (n,) + values.shape[1:])
+            f.offset = c.offset
+        <span class="k">else</span>:                                              <span class="c"># 18 Gated DeltaNet layers</span>
+            f = ArraysCache(size=len(c.cache))
+            f.cache = [<span class="k">None</span> <span class="k">if</span> x <span class="k">is None else</span> mx.broadcast_to(x, (n,) + x.shape[1:])
+                       <span class="k">for</span> x <span class="k">in</span> c.cache]
+        forked.append(f)
+    <span class="k">return</span> forked + [<span class="k">None</span>] * (len(cache) - n_layers)</code></pre>
+      <p>I drive the decoder layers directly instead of calling mlx-vlm's forward. Its forward has special paths for left padding and per-row splitting that I do not need. Owning the loop also gives per-layer hidden states and early exit (<code>n_layers=k</code>) for free. The prefix/suffix split comes from rendering the real chat template around a placeholder query. That picked up something easy to miss by hand: Qwen3.5's generation prompt ends in an empty <code>&lt;think&gt;\n\n&lt;/think&gt;\n\n</code> block, so the decision token sits after it.</p>
+
+      <h3>A control that barely moved</h3>
+      <p>The forked batch is bit-identical to full-sequence runs in both fp32 and bf16, at every layer and at early exit. But the wrong-position control only moved the output to cosine <strong>0.9987</strong>, compared with 0.89 for Qwen3-VL. Only 6 of the 24 layers use rotary positions at all. A tolerance of 0.999, which looked strict, would barely have caught a position bug. Since the correct path is exact, I tightened the tolerance to 0.99999 in both precisions.</p>
+
+      <h3>Latency</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Budget</th><th>Depth</th><th class="n">Frame encode</th><th class="n">6 questions</th><th class="n">32 questions</th><th class="n">Total (6)</th></tr></thead>
+        <tbody>
+          <tr><td>224</td><td>all 24</td><td class="n">73.1 ms</td><td class="n">47.4 ms</td><td class="n">191.7 ms</td><td class="n">120 ms</td></tr>
+          <tr class="hl"><td>224</td><td>stop at 16</td><td class="n">59.4 ms</td><td class="n">31.3 ms</td><td class="n">127.0 ms</td><td class="n">91 ms</td></tr>
+          <tr><td>448</td><td>all 24</td><td class="n">155.6 ms</td><td class="n">62.6 ms</td><td class="n">238.2 ms</td><td class="n">218 ms</td></tr>
+          <tr><td>448</td><td>stop at 16</td><td class="n">133.1 ms</td><td class="n">35.8 ms</td><td class="n">137.8 ms</td><td class="n">169 ms</td></tr>
+        </tbody>
+      </table></div>
+      <p class="caption">MLX, bf16, p50 of 15 runs. The vision encoder alone takes 29.6 ms at 224 and 70.1 ms at 448. Six questions as independent full sequences take 479 ms at 224 and 977 ms at 448, so sharing is 3.9× and 4.9× faster.</p>
+      <p>At 224 the vision encoder alone uses 30 of a 33 ms budget, so a 2B VLM cannot reach 30 Hz on this machine at any resolution. The tiers exist because of that floor. On accuracy, Qwen3.5 tied Qwen3-VL (spatial +0.014, GQA −0.007), with a smaller language-model state and an earlier plateau.</p>
+    </section>
+
+    <!-- ============================================================ 6 -->
+    <section id="video">
+      <h2><span class="num">06</span>From frames to video</h2>
+      <p>Qwen3.5 reads video natively. Frames go in pairs (temporal patch size 2), and each pair is rendered as a timestamp marker followed by its vision block:</p>
+<pre><code>&lt;|im_start|&gt;user\n
+&lt;0.1 seconds&gt;&lt;|vision_start|&gt;&lt;|video_pad|&gt; × 48 &lt;|vision_end|&gt;
+&lt;0.6 seconds&gt;&lt;|vision_start|&gt;&lt;|video_pad|&gt; × 48 &lt;|vision_end|&gt;
+…
+Please answer the following question based on the video:\n</code></pre>
+      <p>The vision encoder's attention is block-diagonal by group: <code>cu_seqlens</code> repeats <code>h × w</code> once per temporal group. A group's vision features therefore do not depend on its neighbours. Each 2-frame group can be encoded once, cached, and reused by every window that contains it.</p>
+      <p><code>video_engine.py</code> builds a window from cached groups:</p>
+      <ul>
+        <li>render the window's token sequence with mlx-vlm's own <code>_timestamped_video_placeholder</code>;</li>
+        <li>take positions from <code>get_rope_index</code>;</li>
+        <li>scatter the cached features with <code>merge_input_ids_with_image_features</code>;</li>
+        <li>run the language model.</li>
+      </ul>
+      <p>Reusing the library's helpers means the token layout cannot drift from the reference path.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Test (<code>tests/test_video_equivalence.py</code>, fp32)</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td>Window from cached groups vs native single-pass video path, all layers</td><td>max diff 0.0</td></tr>
+          <tr><td>Window shifted by one group, reusing cached groups</td><td>exact</td></tr>
+          <tr><td>Early exit at layer 16 vs layer 16 of the full run</td><td>exact</td></tr>
+          <tr><td>Prefix state after answering</td><td>unchanged</td></tr>
+          <tr><td>Control: groups in reverse order; timestamps at half the frame rate</td><td><span class="neg">both change the output</span></td></tr>
+          <tr><td>Streaming prefix (section 10) vs window vs native path</td><td>exact</td></tr>
+        </tbody>
+      </table></div>
+      <div class="note"><span class="tag">bf16 detail</span><p>In bf16, a batch of one question differed from the reference by 0.9% relative while a batch of three matched bit for bit. In fp32 both are exact. Metal picks different kernels for different batch shapes, so in bf16 a decision that sits right at its threshold can flip depending on how many other questions share its batch. The exactness suite runs in fp32 for that reason.</p></div>
+    </section>
+
+    <!-- ============================================================ 7 -->
+    <section id="time">
+      <h2><span class="num">07</span>Does the model use time?</h2>
+      <p>Every video eval runs three conditions per clip, each a separate window prefill with the clip's questions in one batch:</p>
+      <ul>
+        <li><strong>full:</strong> frames in order;</li>
+        <li><strong>single:</strong> the middle frame alone;</li>
+        <li><strong>shuffled:</strong> the same groups in a random order.</li>
+      </ul>
+      <p>Temporal gain is full minus single.</p>
+
+      <h3>MVBench</h3>
+      <p>I downloaded the MVBench subsets whose videos ship publicly (STAR, CLEVRER, SSv2, Moments in Time, VLN-QA): 11 tasks with about 200 questions each. I sampled 16 frames uniformly and set timestamps to match real time, then read the answer as a softmax over option-letter logits.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Task</th><th class="n">Chance</th><th class="n">Full</th><th class="n">Single</th><th class="n">Shuffled</th><th class="n">Temporal gain</th></tr></thead>
+        <tbody>
+          <tr><td>object existence</td><td class="n">0.33</td><td class="n">0.808</td><td class="n">0.510</td><td class="n">0.747</td><td class="n"><span class="pos">+0.298</span></td></tr>
+          <tr><td>moving attribute</td><td class="n">0.36</td><td class="n">0.825</td><td class="n">0.610</td><td class="n">0.710</td><td class="n"><span class="pos">+0.215</span></td></tr>
+          <tr><td>counterfactual inference</td><td class="n">0.35</td><td class="n">0.610</td><td class="n">0.400</td><td class="n">0.605</td><td class="n"><span class="pos">+0.210</span></td></tr>
+          <tr><td>action sequence</td><td class="n">0.25</td><td class="n">0.686</td><td class="n">0.500</td><td class="n">0.601</td><td class="n"><span class="pos">+0.186</span></td></tr>
+          <tr><td>object interaction</td><td class="n">0.25</td><td class="n">0.685</td><td class="n">0.500</td><td class="n">0.675</td><td class="n"><span class="pos">+0.185</span></td></tr>
+          <tr><td>moving count</td><td class="n">0.25</td><td class="n">0.505</td><td class="n">0.395</td><td class="n">0.490</td><td class="n">+0.110</td></tr>
+          <tr><td>action prediction</td><td class="n">0.25</td><td class="n">0.520</td><td class="n">0.430</td><td class="n">0.485</td><td class="n">+0.090</td></tr>
+          <tr><td>action antonym</td><td class="n">0.33</td><td class="n">0.750</td><td class="n">0.675</td><td class="n">0.695</td><td class="n">+0.075</td></tr>
+          <tr><td>egocentric navigation</td><td class="n">0.25</td><td class="n">0.380</td><td class="n">0.330</td><td class="n">0.350</td><td class="n">+0.050</td></tr>
+          <tr><td>fine-grained action</td><td class="n">0.25</td><td class="n">0.410</td><td class="n">0.410</td><td class="n">0.405</td><td class="n">0.000</td></tr>
+          <tr><td>moving direction</td><td class="n">0.25</td><td class="n">0.355</td><td class="n">0.365</td><td class="n">0.320</td><td class="n"><span class="neg">−0.010</span></td></tr>
+        </tbody>
+      </table></div>
+      <p class="caption">Qwen3.5-2B, MLX bf16, 224 budget, 16 frames. Chance is the mean of 1 / options.</p>
+
+      <h3>Synthetic motion with known answers</h3>
+      <p>MVBench says little about the questions a robot asks, such as "is that person approaching?", so I generated 600 labelled clips (4 s at 8 fps, 3,000 questions) from COCO:</p>
+      <ul>
+        <li><strong>Camera motion over a still photo:</strong> zoom in/out (approach/recede), pan left/right, and static.</li>
+        <li><strong>Object motion:</strong> a real COCO person, cut out with its segmentation polygon and pasted onto a person-free background. It grows (approaching), shrinks, moves sideways, or stays still.</li>
+      </ul>
+      <p>Every moving clip has an exact reversal, <code>frames[::-1]</code>, whose answers must flip. A model that answers from appearance cannot pass that test.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Question</th><th class="n">Full (AUROC)</th><th class="n">Single frame</th><th class="n">Reversal consistency</th></tr></thead>
+        <tbody>
+          <tr><td>Is the person moving to the right?</td><td class="n">0.779</td><td class="n">0.728</td><td class="n">0.88</td></tr>
+          <tr><td>Is the person moving to the left?</td><td class="n">0.766</td><td class="n">0.694</td><td class="n">0.82</td></tr>
+          <tr><td>Is the camera panning to the right?</td><td class="n">0.778</td><td class="n">0.530</td><td class="n">0.80</td></tr>
+          <tr><td>Is the camera moving?</td><td class="n">0.713</td><td class="n">0.522</td><td class="n">n/a</td></tr>
+          <tr><td>Is the camera moving forward?</td><td class="n">0.560</td><td class="n">0.516</td><td class="n">0.65</td></tr>
+          <tr class="hl"><td>Is the person moving toward the camera?</td><td class="n">0.526</td><td class="n">0.465</td><td class="n"><span class="neg">0.25</span></td></tr>
+          <tr><td>Mean over 10 questions</td><td class="n">0.665</td><td class="n">0.537</td><td class="n"></td></tr>
+        </tbody>
+      </table></div>
+      <p class="caption">Shuffled groups scored 0.623 on average. Window length barely mattered (1 s: 0.647, 2 s: 0.665, 4 s: 0.673), nor did sampling at 4 instead of 8 fps (0.659). Reversal consistency is the share of forward/reverse pairs whose P(yes) moves in the correct direction; 0.5 is chance.</p>
+      <div class="finding"><span class="tag">Finding</span><p>Given a window, the model is good at <em>what happened</em>: existence, state change, sequence, interaction. It is poor at <em>which way things move</em>. On approach it is consistently wrong: a reversal consistency of 0.25 means receding people get a higher "approaching" score than the same clip played forward. Shuffling costs little, so much of the gain comes from seeing more frames rather than from their order.</p></div>
+    </section>
+
+    <!-- ============================================================ 8 -->
+    <section id="motion">
+      <h2><span class="num">08</span>Motion lives in the features</h2>
+      <p>A wrong zero-shot answer does not mean the information is missing. I cached the decision-token hidden state at every layer for every synthetic clip, trained probes on sources 0–39, and tested on sources 40–59: unseen photos and unseen people. A forward clip and its reversal always stay on the same side of the split.</p>
+      <p>The vision-only baseline uses no language model at all. It is a logistic probe on <code>[pooled(last group) − pooled(first group), mean(pooled)]</code>, a 4,096-dimensional vector the runtime already has for free.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Question</th><th class="n">Zero-shot</th><th class="n">Vision-only probe</th><th class="n">Best LM layer probe</th></tr></thead>
+        <tbody>
+          <tr class="hl"><td>person approaching</td><td class="n">0.545</td><td class="n"><strong>0.938</strong></td><td class="n">0.814 (L24)</td></tr>
+          <tr><td>person receding</td><td class="n">0.629</td><td class="n">0.914</td><td class="n">0.902 (L10)</td></tr>
+          <tr><td>camera moving backward</td><td class="n">0.472</td><td class="n"><strong>0.972</strong></td><td class="n">0.880 (L8)</td></tr>
+          <tr><td>camera moving forward</td><td class="n">0.541</td><td class="n">0.894</td><td class="n">0.898 (L4)</td></tr>
+          <tr><td>person moving left</td><td class="n">0.687</td><td class="n">0.908</td><td class="n">0.901 (L14)</td></tr>
+          <tr><td>person moving right</td><td class="n">0.708</td><td class="n">0.905</td><td class="n">0.896 (L4)</td></tr>
+          <tr><td>camera panning right</td><td class="n">0.848</td><td class="n">0.881</td><td class="n">0.942 (L22)</td></tr>
+          <tr><td>camera moving</td><td class="n">0.756</td><td class="n">0.912</td><td class="n"><strong>0.999</strong> (L24)</td></tr>
+          <tr><td>person moving</td><td class="n">0.642</td><td class="n">0.886</td><td class="n">0.953 (L10)</td></tr>
+        </tbody>
+      </table></div>
+      <p class="caption">Test AUROC on held-out sources 40–59. The language-model probes read the decision token of the full 2 s window; layer 0 of that token is uninformative by construction (0.47–0.52).</p>
+      <p>The runtime ships these as motion heads (<code>heads/motion_*.npz</code>). Each head is trained on sources 0–29, with a temperature fitted on sources 30–39 and a test on 40–59. The approach head reaches <strong>0.945 AUROC and 88% accuracy</strong> at a 0.5 cutoff. It runs as a Tier 1 question, answered about 43 ms after the newest frame, with no language model.</p>
+      <div class="note"><span class="tag">Limitation</span><p>Synthetic zooms and pasted cut-outs carry strong low-level cues, such as a sprite's pixel area growing steadily. These heads need validation on real footage of people approaching before anything relies on them.</p></div>
+    </section>
+
+    <!-- ============================================================ 9 -->
+    <section id="runtime">
+      <h2><span class="num">09</span>The runtime</h2>
+      <p><code>python -m runtime.run --source webcam|clip.mp4</code> turns all of the above into a live loop. It runs as one MLX process, with no torch at runtime.</p>
+      <figure>
+        <div class="diagram">
+<pre class="mermaid">
+%%{init: {'theme':'neutral'}}%%
+flowchart LR
+  SRC["Frame source<br/>webcam or file"] --> CAP["Capture thread<br/>sample 8 fps into 2-frame groups"]
+  CAP --> T0["Tier 0 · camera health<br/>brightness, blur, frozen, occlusion<br/>every frame, CPU"]
+  CAP --> Q[("Group queue<br/>bounded, drop-oldest")]
+  Q --> VIS["Vision encoder<br/>once per group, cached"]
+  VIS --> T1["Tier 1 · linear heads<br/>presence: newest group<br/>motion: window feature change"]
+  VIS --> ST["Running stream<br/>append group once<br/>rebuild every 2 windows"]
+  ST --> T2["Tier 2 · VLM<br/>fork + all due questions<br/>in one batch"]
+  T0 --> BUS["Decision bus<br/>EMA + hysteresis"]
+  T1 --> BUS
+  T2 --> BUS
+  BUS --> OUT["Overlay viewer · JSONL log"]
+</pre>
+        </div>
+        <figcaption>One capture thread, and one worker thread that owns MLX. The OpenCV viewer runs on the main thread, because Cocoa windows must.</figcaption>
+      </figure>
+
+      <h3>The decision contract</h3>
+<pre><code><span class="k">@dataclass</span>
+<span class="k">class</span> Decision:
+    question_id: str
+    answer: str        <span class="c"># "yes" | "no" | "uncertain" | an option</span>
+    p: float           <span class="c"># smoothed probability</span>
+    tier: int          <span class="c"># 0 camera health, 1 linear heads, 2 VLM</span>
+    t_start: float     <span class="c"># oldest frame the answer is based on</span>
+    t_end: float       <span class="c"># newest frame the answer is based on</span>
+    t_decided: float
+    p_raw: float       <span class="c"># unsmoothed model output</span>
+    depth: int         <span class="c"># LM layers used</span>
+    <span class="c"># age_ms = t_decided - t_end: consumers can reject stale answers</span></code></pre>
+      <p>A VLM answer describes frames that are already a couple of hundred milliseconds old. The contract carries that age explicitly, so a consumer never mistakes it for the present.</p>
+
+      <h3>Scheduling rules</h3>
+      <ul>
+        <li><strong>Latency stays bounded.</strong> In realtime mode, when the worker falls behind, the oldest queued groups are dropped and the window restarts. A window must be contiguous or its timestamps would be false. Tier 2 is skipped while a backlog exists.</li>
+        <li><strong>Tier 2 fires on every new group, up to each question's rate.</strong> Scene changes (a jump in pooled-feature cosine distance) ask every question immediately.</li>
+        <li><strong>Tier 1 publishes before any language-model work,</strong> so presence and motion answers never wait behind a prefill.</li>
+      </ul>
+
+      <h3>Asking your own questions</h3>
+      <p>Questions are data, not code. Each lives in a YAML file with a short id for the overlay panel; <code>--questions my.yaml</code> loads a file and <code>--ask "…"</code> adds one-off questions on the command line. Yes/no and multiple-choice questions share one batch per tick:</p>
+<pre><code>- id: coffee
+  text: Is the person drinking from a cup or mug?
+  enter: 0.55     <span class="c"># switch on fast: a sip lasts a second or two</span>
+  ema: 0.7
+- id: activity
+  kind: choice
+  text: What is the person mainly doing?
+  options: [typing, writing, drinking, on phone, reading, idle, away]
+  rate_hz: 1      <span class="c"># slow-changing: once a second is enough</span></code></pre>
+      <p>A desk-work set of 18 questions (pen, coffee, phone, glasses, headphones, looking away, a second person, and an activity choice) batches into <strong>136 ms</strong> per tick, 220 ms for the whole tick, just inside the 250 ms needed for 4 Hz. Phrasing matters in ways specific to the camera: from a laptop's own webcam the laptop is not in view, so "Is the person sitting in front of a laptop?" scored 0.23 on a frame of someone doing exactly that, while "Is the person looking toward the camera?" scored 0.98.</p>
+
+      <h3>Heads must be trained on the path they run on</h3>
+      <p>The first Tier 1 heads were trained on the image-path features from the ladder study. The runtime computes features on the video path (<code>encode_group</code> with the frame duplicated), and the two processors resize differently. The features agreed on average (cosine 0.97) but not everywhere (minimum 0.84). Ranking quality survived, but individual probabilities moved by up to 0.66, enough to break any calibrated threshold. I retrained on video-path features: AUROC 0.979 for human, 0.966 for vehicle and 0.964 for animal, with a 7% miss rate for humans at 0.5. That was still not enough, as the first real webcam session showed (<a href="#field">section 11</a>).</p>
+
+      <h3>Bugs the benchmark found</h3>
+      <p>I built a replay benchmark from held-out synthetic clips: 128 s, alternating motion and static segments, with ground truth per segment. I played it through the runtime in real time. It found three scheduling bugs that unit tests would not have:</p>
+      <ol>
+        <li><strong>Rate limit on the wrong clock.</strong> A question's "last asked" time was the decision time, which lands about 230 ms after the frames. The next group, 250 ms later, looked too soon, so every other tick was skipped: 2.0 Hz. The rate is now measured on video time.</li>
+        <li><strong>Tolerance smaller than jitter.</strong> Realtime file replay stamps frames after a <code>sleep</code>, so group gaps ran from 242 to 258 ms around a nominal 250. A 1 ms tolerance rejected 38% of groups. It is now 50 ms, still at most one answer per group.</li>
+        <li><strong>Tier 1 behind the language model.</strong> Adding streaming (next section) put the append before the heads, and Tier 1 age rose from 28 ms to 132 ms.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ 10 -->
+    <section id="stream">
+      <h2><span class="num">10</span>Streaming prefill</h2>
+      <p>With a sliding window, every tick re-prefills 2 s of video, about 450 tokens. That took 133–149 ms, 65% of the tick. The model is causal, so appending group k to a state that already holds groups 0…k−1 gives the same result as encoding all k+1 groups at once. The one obstacle is the template: the instruction text comes <em>after</em> the video. A stream therefore holds only the header and the groups, and the instruction moves to the start of every question's suffix. That is still exact, and the test suite confirms stream = window = native path.</p>
+
+      <h3>Where an append spends its time</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Step, 56 new tokens on a 451-token stream</th><th class="n">Time</th></tr></thead>
+        <tbody>
+          <tr><td>tokenize the new group's text</td><td class="n">0.04 ms</td></tr>
+          <tr><td><code>get_rope_index</code> over the whole sequence</td><td class="n">5.84 ms</td></tr>
+          <tr><td>language model, 1 / 6 / 12 / 24 layers</td><td class="n">1.9 / 10.1 / 19.0 / 38.4 ms</td></tr>
+          <tr><td>for comparison: full window prefill, 451 tokens</td><td class="n">138.6 ms</td></tr>
+        </tbody>
+      </table></div>
+      <p>A small append costs about 1.6 ms per layer. That is fixed per-call overhead rather than per-token compute: 8× fewer tokens were only 3.6× cheaper. This decided the design:</p>
+      <ul>
+        <li><strong>Two staggered streams were worse than one.</strong> Keeping two streams, so one always has enough history, meant two appends per group and paid the fixed cost twice. The tick dropped only from 221 to 196 ms.</li>
+        <li><strong>One stream plus a rebuild.</strong> When the stream reaches 2 windows' worth of groups, it is rebuilt from the last window's cached groups in a single forward, about 130 ms once every 2 s. Questions always see 2–4 s of history, and the eval showed window length barely affects accuracy.</li>
+        <li><strong>Positions are precomputed.</strong> They depend only on the token layout, never on pixel content, so they are computed once per frame size and sliced. That removed 6 ms per append.</li>
+      </ul>
+
+      <h3>Result</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>128 s replay, realtime, 224 budget, 8 fps, 6 questions</th><th class="n">Window mode</th><th class="n">Stream mode</th></tr></thead>
+        <tbody>
+          <tr><td>Tier 2 rate</td><td class="n">3.97 Hz</td><td class="n">3.96 Hz</td></tr>
+          <tr><td>Tick p50 / p95</td><td class="n">228 / 247 ms</td><td class="n"><strong>152</strong> / 243 ms</td></tr>
+          <tr><td>Prefill work per tick, p50</td><td class="n">149 ms</td><td class="n">42 ms (134 ms on rebuild ticks)</td></tr>
+          <tr><td>6 questions, p50</td><td class="n">52 ms</td><td class="n">67 ms</td></tr>
+          <tr><td>GPU busy</td><td class="n">90%</td><td class="n"><strong>64%</strong></td></tr>
+          <tr><td>Tier 2 answer age p50 / p95</td><td class="n">229 / 322 ms</td><td class="n"><strong>153 / 244 ms</strong></td></tr>
+          <tr><td>Tier 1 answer age p50</td><td class="n">27 ms</td><td class="n">43 ms</td></tr>
+          <tr><td>Dropped groups</td><td class="n">0</td><td class="n">0</td></tr>
+        </tbody>
+      </table></div>
+      <p>Questions cost a little more in stream mode because they read up to 4 s of history and each suffix carries the instruction. The net result is a 33% shorter tick, answers 76 ms fresher, and a third of the GPU free for more questions or a higher resolution. Stream mode is the runtime's default.</p>
+    </section>
+
+
+    <!-- ============================================================ 11 -->
+    <section id="field">
+      <h2><span class="num">11</span>Field test: the webcam said I wasn't there</h2>
+      <p>The first real webcam session showed <code>T1 human_present: no (0.20)</code>, steadily, with a person sitting in the middle of the frame. Benchmarks had put this head at 0.98 AUROC.</p>
+
+      <h3>Ruling things out</h3>
+      <p><code>video_eval/webcam_probe.py</code> grabs frames through exactly the runtime's capture and vision path and reports what the head receives. Nothing about the frames was wrong:</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Check</th><th>Result</th><th>Verdict</th></tr></thead>
+        <tbody>
+          <tr><td>Capture and model input</td><td>1920×1080 → 288×160, 45 visual tokens</td><td>as designed</td></tr>
+          <tr><td>Exposure and colour balance</td><td>brightness 141–143, RGB ≈ 150/142/134</td><td>normal</td></tr>
+          <tr><td>RGB/BGR mix-up</td><td>channels swapped: P(human) 0.29–0.33</td><td>not the cause</td></tr>
+          <tr><td>Aspect ratio, resolution, close-up framing</td><td>another photo's person cropped to 16:9 at 1280×720 and 1920×1080: 0.92–0.98</td><td>not the cause</td></tr>
+          <tr><td>Person size</td><td>COCO test people filling 10–60% of the frame: median P 0.99</td><td>not the cause</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Isolating it on the real frame</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Input</th><th class="n">P(human)</th></tr></thead>
+        <tbody>
+          <tr><td>Full frame</td><td class="n">0.21</td></tr>
+          <tr><td>Crop around the person</td><td class="n">0.43</td></tr>
+          <tr><td>Tight head and shoulders</td><td class="n">0.70</td></tr>
+          <tr><td>Background only</td><td class="n">0.01</td></tr>
+          <tr class="hl"><td>Tier 2, zero-shot "Is a human present in the video?"</td><td class="n"><strong>1.00</strong></td></tr>
+        </tbody>
+      </table></div>
+      <p>The model saw the person; the cheap head did not. The first hypothesis was dilution: the head reads the mean of all visual tokens, and a strongly patterned curtain filled much of the frame. Adding the max over tokens to the mean made it <em>worse</em> (0.10–0.12). The real cause was simpler: the head was a logistic regression over 2,048 dimensions trained on <strong>307 images</strong>. That is enough to score well on more COCO photos and not enough to leave their distribution.</p>
+
+      <h3>The fix: data first, then pooling</h3>
+      <p>I added 3,000 COCO train2017 images (half with people, many indoor), which never overlap the val-based test split, and chose mean or mean+max pooling per head on that test split.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Head</th><th class="n">COCO test AUROC, 307 images</th><th class="n">COCO test AUROC, +3,000</th><th>Pooling</th></tr></thead>
+        <tbody>
+          <tr><td>human</td><td class="n">0.979</td><td class="n">0.985</td><td>mean + max</td></tr>
+          <tr><td>vehicle</td><td class="n">0.966</td><td class="n">0.985</td><td>mean</td></tr>
+          <tr><td>animal</td><td class="n">0.964</td><td class="n">0.968</td><td>mean + max</td></tr>
+        </tbody>
+      </table></div>
+      <ul>
+        <li><strong>Webcam frames:</strong> 0.16–0.22 → <strong>0.56–0.69</strong>, above the 0.4 "yes" threshold. Pure background stays near 0.01.</li>
+        <li><strong>Why mean + max for humans:</strong> better calibrated (error 0.018 vs 0.030), and a crop of a shirt hanging on a door scored 0.15 instead of 0.43.</li>
+        <li><strong>A cross-check:</strong> the default questions now include a Tier 2 "Is there a person in the video?". On the webcam clip, Tier 1 says yes (0.61) and Tier 2 says yes (1.00), so a safety-relevant answer never rests on the cheap head alone.</li>
+      </ul>
+      <div class="note"><span class="tag">Limitation</span><p>The webcam check is six frames of one person in one room: a sanity check, not a benchmark. The heads were chosen on the COCO test split, not on these frames, to avoid tuning to them. A real evaluation needs clips across rooms, lighting and people.</p></div>
+      <div class="finding"><span class="tag">Lesson</span><p>The benchmark said 0.98 and the webcam said 0.2, and both were true. A head is only as general as its training set, and it has to be trained on the exact path it runs on.</p></div>
+    </section>
+
+    <!-- ============================================================ 12 -->
+    <section id="lessons">
+      <h2><span class="num">12</span>What I learned</h2>
+      <ul>
+        <li><strong>Every exactness claim needs a control that must fail.</strong> The wrong-position control worked well on Qwen2-VL (cosine 0.89) and barely at all on Qwen3.5 (0.9987). Without it, a loose tolerance would have blessed a position bug.</li>
+        <li><strong>Tokenization and positions caused more of the early bugs than attention did.</strong> A trailing space and an index convention broke equivalence long before the attention logic did.</li>
+        <li><strong>A VLM is worth its cost for relational decisions, not detection.</strong> Presence is solved by the vision encoder alone or an 8 ms classifier. Spatial and compositional questions go from chance to 0.85+.</li>
+        <li><strong>Zero-shot answers rank better than they decide.</strong> Uncalibrated probabilities, and for motion direction systematically wrong ones, sit on top of internal states that a linear probe reads well.</li>
+        <li><strong>On Apple Silicon at 2B scale, fixed per-layer overhead dominates small calls.</strong> This made 4-bit weights slower than bf16, made two streams slower than one, and set the vision encoder as the floor on frame rate.</li>
+        <li><strong>Train heads on the exact runtime path, with enough variety.</strong> Two processors that resize differently moved calibrated probabilities by up to 0.66, and a head trained on 307 images scored 0.98 on COCO and 0.2 on a webcam.</li>
+        <li><strong>Test on the device, early.</strong> A six-frame webcam probe found a failure that 1,100 benchmark images, a 10k-question ladder and a replay benchmark had not.</li>
+        <li><strong>End-to-end replay finds what unit tests cannot.</strong> Clock domains, jitter and ordering mistakes only show up with real timing.</li>
+      </ul>
+
+      <h3>Open problems</h3>
+      <ul>
+        <li><strong>Real footage.</strong> Validate the motion heads on recorded clips of people approaching, receding and passing, and evaluate the presence heads across rooms, lighting and people.</li>
+        <li><strong>Per-question thresholds.</strong> The default hysteresis thresholds (0.65 / 0.35) can erase a correct but uncalibrated zero-shot signal. Each question needs thresholds fitted to its own calibration.</li>
+        <li><strong>Accuracy of the live replay.</strong> The replay has only two segments per motion kind, which is too few to rank methods. The offline held-out evaluation remains the accuracy measure.</li>
+        <li><strong>Reasoning accuracy.</strong> 77–80% on spatial and compositional questions is the weakest number here. The next test is Qwen3.5-4B on the reasoning tier.</li>
+      </ul>
+    </section>
+
+    <!-- ============================================================ 13 -->
+    <section id="repro">
+      <h2><span class="num">13</span>Reproducing it</h2>
+      <p>Two environments: <code>venv</code> (PyTorch, transformers 5.17, sklearn) for training probes and heads, and <code>venv-mlx</code> (MLX 0.32, mlx-vlm 0.7.2) for everything that runs.</p>
+<pre><code><span class="c"># exactness</span>
+venv-mlx/bin/python mlx_check_equivalence.py --fp32            <span class="c"># image engine, Qwen3.5</span>
+venv-mlx/bin/python mlx_check_equivalence.py --fp32 --wrong-pos  <span class="c"># control: must fail</span>
+venv-mlx/bin/python -m pytest tests/test_video_equivalence.py -q <span class="c"># video + streaming, 6 tests</span>
+
+<span class="c"># data</span>
+venv/bin/python data/build_eval_set.py                          <span class="c"># COCO presence + synthetic faults</span>
+venv/bin/python data/build_ladder.py                            <span class="c"># presence, VSR, GQA</span>
+venv-mlx/bin/python video_eval/build_synthetic_motion.py        <span class="c"># 600 motion clips</span>
+
+<span class="c"># studies</span>
+venv/bin/python eval.py --report                                <span class="c"># section 3</span>
+venv-mlx/bin/python mlx_ladder_extract.py --budget 448 &amp;&amp; venv/bin/python ladder.py report
+venv-mlx/bin/python video_eval/eval_video.py mvbench            <span class="c"># section 7</span>
+venv-mlx/bin/python video_eval/motion_probes.py extract &amp;&amp; venv/bin/python video_eval/motion_probes.py fit
+
+<span class="c"># heads</span>
+venv-mlx/bin/python data/build_head_trainset.py                 <span class="c"># 3,000 extra COCO train2017 images</span>
+venv-mlx/bin/python video_eval/validate_heads.py --dump --dump-train   <span class="c"># runtime-path features</span>
+venv/bin/python export_heads.py                                 <span class="c"># presence heads, pooling per head</span>
+venv/bin/python video_eval/motion_probes.py export              <span class="c"># motion heads</span>
+
+<span class="c"># runtime</span>
+venv-mlx/bin/python -m runtime.run --source webcam
+venv-mlx/bin/python -m runtime.run --source webcam --questions my.yaml --ask "Is someone waving?"
+venv-mlx/bin/python video_eval/webcam_probe.py                  <span class="c"># what the heads see on your camera</span>
+venv-mlx/bin/python -m runtime.run --source data/video_eval/replay.mp4 \
+    --questions video_eval/replay_questions.yaml --no-view --log results/replay_run_stream.jsonl
+venv-mlx/bin/python video_eval/runtime_bench.py analyze results/replay_run_stream.jsonl \
+    --segments data/video_eval/replay.json</code></pre>
+      <div class="table-wrap"><table>
+        <thead><tr><th>File</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><code>engine.py</code></td><td>PyTorch shared-prefix engine (Qwen2/3-VL, MPS)</td></tr>
+          <tr><td><code>mlx_engine.py</code></td><td>MLX engine for hybrid Qwen3.5: zero-copy fork, per-layer states, early exit</td></tr>
+          <tr><td><code>video_engine.py</code></td><td>per-group vision cache, window prefill, streaming prefix, yes/no and multiple-choice readouts</td></tr>
+          <tr><td><code>runtime/</code></td><td>sources, scheduler, tiers, heads, decision bus, viewer, CLI</td></tr>
+          <tr><td><code>eval.py</code>, <code>ladder.py</code></td><td>presence eval and layer-wise ladder probes</td></tr>
+          <tr><td><code>video_eval/</code></td><td>synthetic motion, MVBench eval, motion probes, runtime benchmark, webcam probe</td></tr>
+          <tr><td><code>results/</code></td><td>every report quoted in this article</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <footer class="end">
+      All figures come from runs on one Apple M5 with 16 GB of unified memory, reported as p50/p95 where timed. Accuracy numbers are single-split results; differences under about 0.005 AUROC are within noise.
+    </footer>
+  </article>
+</div>
+
+<script>
+(function () {
+  // Probe AUROC by layer (every other layer), from results/ladder_report.txt, 448 budget.
+  const data = {
+    qwen35: { name: "Qwen3.5-2B", layers: 24, cls: "s1",
+      spatial: [.500,.511,.504,.548,.584,.718,.814,.860,.859,.864,.857,.854,.839],
+      gqa:     [.500,.563,.575,.609,.667,.758,.825,.849,.850,.850,.843,.836,.841] },
+    qwen3vl: { name: "Qwen3-VL-2B", layers: 28, cls: "s2",
+      spatial: [.500,.517,.522,.516,.555,.576,.578,.656,.823,.840,.843,.850,.847,.839,.839],
+      gqa:     [.500,.551,.555,.588,.634,.646,.690,.773,.857,.851,.856,.857,.856,.854,.850] }
+  };
+  const panels = [["spatial", "Spatial relations (VSR)"], ["gqa", "Compositional (GQA yes/no)"]];
+  const W = 360, H = 230, m = { l: 36, r: 16, t: 12, b: 34 };
+  const x = f => m.l + f * (W - m.l - m.r);
+  const yMin = 0.45, yMax = 0.9;
+  const y = v => m.t + (1 - (v - yMin) / (yMax - yMin)) * (H - m.t - m.b);
+  const ns = "http://www.w3.org/2000/svg";
+  const el = (tag, attrs, parent) => { const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent && parent.appendChild(e); return e; };
+  const pts = (model, key) => data[model][key].map((v, i) => ({ layer: i * 2, f: (i * 2) / data[model].layers, v }));
+  const root = document.getElementById("depth-chart");
+
+  panels.forEach(([key, title]) => {
+    const panel = document.createElement("div");
+    panel.className = "panel";
+    panel.innerHTML = `<h4>${title}</h4>`;
+    const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${title}: probe AUROC by relative depth for both models` }, panel);
+    [0.5, 0.6, 0.7, 0.8, 0.9].forEach(v => {
+      el("line", { x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1 }, svg);
+      const t = el("text", { x: m.l - 6, y: y(v) + 3.5, "text-anchor": "end" }, svg); t.textContent = v.toFixed(1);
+    });
+    [0, 0.25, 0.5, 0.75, 1].forEach(f => {
+      const t = el("text", { x: x(f), y: H - m.b + 16, "text-anchor": "middle" }, svg); t.textContent = Math.round(f * 100) + "%";
+    });
+    const xl = el("text", { x: x(0.5), y: H - 4, "text-anchor": "middle" }, svg); xl.textContent = "relative depth (layer / total layers)";
+    el("line", { x1: m.l, x2: W - m.r, y1: y(0.5), y2: y(0.5), stroke: "var(--rule-strong)", "stroke-width": 1, "stroke-dasharray": "3 3" }, svg);
+    const chance = el("text", { x: W - m.r, y: y(0.5) - 5, "text-anchor": "end" }, svg); chance.textContent = "chance";
+
+    ["qwen3vl", "qwen35"].forEach(model => {
+      const p = pts(model, key);
+      const color = model === "qwen35" ? "var(--series-1)" : "var(--series-2)";
+      el("path", { d: p.map((q, i) => `${i ? "L" : "M"}${x(q.f).toFixed(1)},${y(q.v).toFixed(1)}`).join(""), fill: "none", stroke: color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+      const last = p[p.length - 1];
+      el("circle", { cx: x(last.f), cy: y(last.v), r: 3.5, fill: color, stroke: "var(--surface)", "stroke-width": 2 }, svg);
+    });
+
+    const cross = el("line", { y1: m.t, y2: H - m.b, stroke: "var(--rule-strong)", "stroke-width": 1, visibility: "hidden" }, svg);
+    const dots = ["qwen35", "qwen3vl"].map(model => el("circle", { r: 4.5, fill: model === "qwen35" ? "var(--series-1)" : "var(--series-2)", stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden" }, svg));
+    const tip = document.createElement("div"); tip.className = "tip"; tip.hidden = true; panel.appendChild(tip);
+    const hit = el("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent" }, svg);
+
+    const show = evt => {
+      const r = svg.getBoundingClientRect();
+      const fx = ((evt.clientX - r.left) / r.width * W - m.l) / (W - m.l - m.r);
+      const f = Math.max(0, Math.min(1, fx));
+      const near = model => pts(model, key).reduce((a, b) => Math.abs(b.f - f) < Math.abs(a.f - f) ? b : a);
+      const a = near("qwen35"), b = near("qwen3vl");
+      cross.setAttribute("x1", x(f)); cross.setAttribute("x2", x(f)); cross.setAttribute("visibility", "visible");
+      [[dots[0], a], [dots[1], b]].forEach(([d, q]) => { d.setAttribute("cx", x(q.f)); d.setAttribute("cy", y(q.v)); d.setAttribute("visibility", "visible"); });
+      tip.innerHTML = `<b>${Math.round(f * 100)}% depth</b><br>` +
+        `<span class="sw" style="background:var(--series-1)"></span>Qwen3.5-2B L${a.layer}: <b>${a.v.toFixed(3)}</b><br>` +
+        `<span class="sw" style="background:var(--series-2)"></span>Qwen3-VL-2B L${b.layer}: <b>${b.v.toFixed(3)}</b>`;
+      tip.hidden = false;
+      const px = (evt.clientX - panel.getBoundingClientRect().left);
+      const pw = panel.getBoundingClientRect().width;
+      tip.style.left = Math.min(Math.max(px + 12, 0), pw - tip.offsetWidth) + "px";
+      tip.style.top = "30px";
+    };
+    const hide = () => { tip.hidden = true; cross.setAttribute("visibility", "hidden"); dots.forEach(d => d.setAttribute("visibility", "hidden")); };
+    hit.addEventListener("pointermove", show);
+    hit.addEventListener("pointerleave", hide);
+    root.appendChild(panel);
+  });
+
+  // Table view
+  const rows = [];
+  ["qwen35", "qwen3vl"].forEach(model => {
+    data[model].spatial.forEach((v, i) => rows.push(`<tr><td>${data[model].name}</td><td class="n">L${i * 2}</td><td class="n">${Math.round(i * 200 / data[model].layers)}%</td><td class="n">${v.toFixed(3)}</td><td class="n">${data[model].gqa[i].toFixed(3)}</td></tr>`));
+  });
+  document.getElementById("depth-table").innerHTML =
+    `<table><thead><tr><th>Model</th><th class="n">Layer</th><th class="n">Depth</th><th class="n">Spatial</th><th class="n">GQA</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+})();
+</script>
+</body>
+</html>

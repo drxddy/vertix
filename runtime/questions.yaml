@@ -1,0 +1,56 @@
+# Default generic question set. Tier 2 questions are answered by the VLM over the last `window` seconds;
+# yes/no questions use the LM head's P(Yes) (zero-shot), choice questions a softmax over option letters.
+# Tier 1 questions use exported linear heads on pooled vision features (created by export_heads.py);
+# entries whose head file is missing are skipped at startup.
+questions:
+  # --- Tier 2: short-horizon motion / intent (needs the multi-frame window) ---
+  - id: person_present
+    text: Is there a person in the video?     # cross-check for the Tier 1 human_present head
+  - id: person_approaching
+    text: Is a person moving toward the camera?
+  - id: something_entering
+    text: Is something or someone entering the scene?
+  - id: vehicle_approaching
+    text: Is a vehicle moving toward the camera?
+  - id: camera_moving
+    text: Is the camera itself moving?
+  - id: path_clear
+    text: Is the path directly in front of the camera clear of obstacles?
+  - id: person_activity
+    kind: choice
+    text: What is the main person in the video doing?
+    options: [walking, standing still, sitting, no person is visible]
+    rate_hz: 1.0
+
+  # --- Tier 1: per-group presence heads (no language model) ---
+  # Thresholds are on calibrated probabilities. human_present is safety-relevant, so it switches to
+  # "yes" early (test miss rate at 0.5 is 7%; lower enter trades false alarms for fewer misses).
+  - id: human_present
+    tier: 1
+    head: heads/human.npz
+    enter: 0.4
+    exit: 0.2
+  - id: vehicle_present
+    tier: 1
+    head: heads/vehicle.npz
+    enter: 0.5
+    exit: 0.3
+  - id: animal_present
+    tier: 1
+    head: heads/animal.npz
+    enter: 0.5
+    exit: 0.3
+
+  # --- Tier 1 motion heads: linear probes on how the window's vision features change (no LM) ---
+  # Trained on synthetic motion clips (video_eval/motion_probes.py): zero-shot VLM answers to these
+  # were near chance (approach AUROC 0.55) while these heads reach 0.86-0.95 on held-out sources.
+  # Needs a full window at the trained setting (2 s @ 8 fps). Validate on real footage before trusting.
+  - id: person_approaching_motion
+    tier: 1
+    head: heads/motion_obj_approach.npz
+  - id: person_receding_motion
+    tier: 1
+    head: heads/motion_obj_recede.npz
+  - id: camera_moving_motion
+    tier: 1
+    head: heads/motion_cam_moving.npz
